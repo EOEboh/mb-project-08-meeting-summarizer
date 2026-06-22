@@ -11,12 +11,12 @@ Upload a meeting recording and get structured notes: a summary, decisions made, 
 A meeting notes tool where:
 
 - The user uploads an audio file (WAV, MP3, M4A, OGG, FLAC, WebM)
-- **Step 1** — whisper.cpp transcribes the audio to text (a separate local AI service)
+- **Step 1** — Go calls the `whisper-cli` binary as a subprocess to transcribe the audio to text
 - **Step 2** — llama3.2:3b receives the transcript and returns a structured four-section summary
 - The result renders as four cards: Meeting Summary, Decisions Made, Action Items, Next Steps
-- Action items render as interactive checkboxes (goldmark converts `- [ ]` syntax to HTML checkboxes)
-- A collapsible section shows the raw Whisper transcript for verification
-- A Download button exports the full summary as `meeting-notes.md`
+- Action items render as interactive checkboxes (`- [ ]` markdown rendered by goldmark)
+- A collapsible panel shows the full raw transcript
+- A Download button exports the summary as `meeting-notes.md`
 
 ---
 
@@ -24,62 +24,221 @@ A meeting notes tool where:
 
 | Concept | What It Teaches |
 |---|---|
-| Two-service AI pipeline | Routing to the right model for the right modality: Whisper (speech-to-text) then Ollama (language reasoning) |
-| `whisper/client.go` package | A second AI service client alongside `ai/ollama.go` — same HTTP pattern, different API |
+| Two-service AI pipeline | Routing to the right model for the right modality: Whisper for audio, Ollama for language |
+| `exec.Command` subprocess | Calling an external binary from Go and capturing its output |
+| `os.CreateTemp` + `defer os.Remove` | Writing a short-lived file safely and guaranteeing cleanup on all return paths |
+| `godotenv` | Loading a `.env` file at Go startup without manual `source` or `export` commands |
+| `exec.LookPath` | Checking whether a binary exists on the system PATH before trying to run it |
 | Audio file validation | Extension-based validation and why `http.DetectContentType` is unreliable for audio |
-| Long HTTP client timeout | `http.Client{Timeout: 10 * time.Minute}` for operations that legitimately take minutes |
-| Structured four-section parsing | Same `parseSections` pattern from Project 03, applied to a richer output schema |
+| Four-section structured parsing | The same `parseSections` pattern from Project 03 applied to a richer meeting schema |
 | GitHub task list rendering | goldmark converts `- [ ]` to `<input type="checkbox">` for interactive action items |
-| Three running services | First project requiring orchestration of three local processes simultaneously |
 
 ---
 
 ## Prerequisites
 
 - Go 1.22+
-- Ollama running with `llama3.2:3b` pulled
-- whisper.cpp compiled and its server running on port 8888
+- Ollama installed with `llama3.2:3b` pulled
+- `whisper-cli` binary installed (setup below, per OS)
+- A whisper ggml model file downloaded (setup below)
 
 ---
 
-## Setup
+## Part 1: Install whisper.cpp
 
-### 1. whisper.cpp (do this once)
+### macOS
 
 ```bash
-# Clone and build
-git clone https://github.com/ggerganov/whisper.cpp
-cd whisper.cpp
-make
-
-# Download the base.en model (~150 MB)
-bash models/download-ggml-model.sh base.en
-
-# Start the server on port 8888
-./server -m models/ggml-base.en.bin --port 8888
+brew install whisper-cpp
 ```
 
-### 2. Go dependencies
+> **Note:** Despite the package being called `whisper-cpp`, Homebrew installs a binary named `whisper-cli`. This is correct and expected.
+
+Confirm the binary is there:
+
+```bash
+which whisper-cli
+# Should print: /opt/homebrew/bin/whisper-cli
+```
+
+---
+
+### Linux (Ubuntu / Debian)
+
+```bash
+sudo apt update && sudo apt install -y cmake build-essential git
+
+cd ~
+git clone https://github.com/ggerganov/whisper.cpp
+cd whisper.cpp
+cmake -B build && cmake --build build --config Release
+```
+
+Add the binary to your PATH (add this line to `~/.bashrc` to make it permanent):
+
+```bash
+export PATH="$PATH:$HOME/whisper.cpp/build/bin"
+source ~/.bashrc
+```
+
+Confirm:
+
+```bash
+which whisper-cli
+```
+
+---
+
+### Windows (MSYS2)
+
+1. Install [MSYS2](https://www.msys2.org) and open the **MSYS2 UCRT64** terminal.
+
+2. Install build tools:
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-gcc git curl
+```
+
+3. Clone and build:
+
+```bash
+cd ~
+git clone https://github.com/ggerganov/whisper.cpp
+cd whisper.cpp
+cmake -B build && cmake --build build --config Release
+export PATH="$PATH:$(pwd)/build/bin"
+```
+
+Add the `export PATH` line to `~/.bashrc` to make it permanent.
+
+---
+
+## Part 2: Download the model
+
+This step is the same on all platforms. Run it once and the model lives at `~/whisper-models/ggml-base.en.bin`.
+
+```bash
+mkdir -p ~/whisper-models
+curl -L -o ~/whisper-models/ggml-base.en.bin \
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+```
+
+The download is approximately 150 MB.
+
+Verify transcription works before continuing:
+
+```bash
+# Download an 11-second sample clip
+curl -L -o /tmp/jfk.wav \
+  "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav"
+
+# Transcribe it
+whisper-cli -m ~/whisper-models/ggml-base.en.bin -f /tmp/jfk.wav
+# Should print: "And so my fellow Americans..."
+```
+
+If that works, whisper is correctly installed.
+
+---
+
+## Part 3: Set up the Go project
 
 ```bash
 git clone https://github.com/EOEboh/mb-project-08-meeting-summarizer
 cd mb-project-08-meeting-summarizer
-make setup
 ```
 
-### 3. Run (three terminals)
+Copy the environment file and fill in your actual paths:
 
 ```bash
-# Terminal 1
-ollama serve
+cp .env.example .env
+```
 
-# Terminal 2 (from your whisper.cpp directory)
-./server -m models/ggml-base.en.bin --port 8888
+Open `.env` in your editor. The two values you must set correctly:
 
-# Terminal 3 (from this project)
+```bash
+# Find your actual username
+echo $USER
+```
+
+```env
+# macOS example (replace "yourname" with your actual username from echo $USER):
+WHISPER_MODEL=/Users/yourname/whisper-models/ggml-base.en.bin
+WHISPER_BIN=whisper-cli
+
+# Linux example:
+WHISPER_MODEL=/home/yourname/whisper-models/ggml-base.en.bin
+WHISPER_BIN=whisper-cli
+
+# Windows (MSYS2) example:
+WHISPER_MODEL=C:/Users/yourname/whisper-models/ggml-base.en.bin
+WHISPER_BIN=whisper-cli
+```
+
+> **Important:** The app reads `.env` automatically at startup via `godotenv`. You do not need to run `source .env` or `export` anything manually.
+
+Install Go dependencies:
+
+```bash
+make tidy
+```
+
+---
+
+## Part 4: Verify everything before running
+
+```bash
+make check
+```
+
+You should see all three sections showing green:
+
+```
+=== Whisper binary ===
+  whisper-cli: /opt/homebrew/bin/whisper-cli
+
+=== Whisper model ===
+  Found (default): /Users/yourname/whisper-models/ggml-base.en.bin
+
+=== Ollama ===
+  Running at localhost:11434
+```
+
+If anything shows NOT FOUND, fix it before continuing. Do not skip this step.
+
+---
+
+## Part 5: Run
+
+> **macOS users:** Ollama runs as a background service and starts automatically on login. If `make check` shows Ollama running, you do not need to run `ollama serve`. If it shows NOT running, start it with `ollama serve`.
+
+```bash
+# If Ollama is not already running:
+ollama serve   # keep this terminal open
+
+# Start the Go server (in a new terminal):
 make run
 # → http://localhost:8080
 ```
+
+If you see `bind: address already in use` on port 8080, another process is using it:
+
+```bash
+kill $(lsof -t -i :8080)
+make run
+```
+
+---
+
+## Common Issues
+
+| Error | Cause | Fix |
+|---|---|---|
+| `whisper model not found at /Users/yourname/...` | Wrong username in WHISPER_MODEL | Run `echo $USER`, update .env with the correct username |
+| `whisper binary "whisper-cli" not found` | whisper-cli not on PATH | macOS: `brew install whisper-cpp`. Linux: add build/bin to PATH |
+| `address already in use` on port 8080 | Another process on port 8080 | `kill $(lsof -t -i :8080)` then `make run` |
+| `ollama serve` error: address in use | Ollama already running | Good — skip that step, it is already running |
+| Empty transcript | Silent or very short audio | Use a real recording with clear speech |
 
 ---
 
@@ -87,18 +246,18 @@ make run
 
 ```
 mb-project-08-meeting-summarizer/
-├── main.go                   Three routes: /, /summarize, /export
-├── go.mod                    goldmark only (whisper.cpp is a separate process)
-├── Makefile                  make run, make setup, make setup-whisper
-├── .env.example
+├── main.go              loads .env via godotenv, registers 3 routes
+├── go.mod               godotenv + goldmark
+├── .env.example         copy to .env and fill in your paths
+├── Makefile             make run, make check, make setup
 ├── whisper/
-│   └── client.go             HTTP client for the whisper.cpp /inference endpoint
+│   └── client.go        calls whisper-cli as a subprocess via exec.Command
 ├── ai/
-│   └── ollama.go             Chat() unchanged from scaffold
+│   └── ollama.go        calls Ollama via HTTP as in every other project
 ├── handlers/
-│   └── notes.go              Two-service pipeline, section parsing, export
+│   └── notes.go         two-service pipeline, section parsing, export
 ├── templates/
-│   └── index.html            "index" + "result" named templates
+│   └── index.html       "index" + "result" named templates
 └── static/
     └── style.css
 ```
@@ -108,69 +267,60 @@ mb-project-08-meeting-summarizer/
 ## Architecture
 
 ```
-Browser                   Go Server                 Whisper Server       Ollama
-  |                           |                     (port 8888)          (port 11434)
-  |  POST /summarize          |                           |                   |
-  |  multipart: audio file    |                           |                   |
-  |-------------------------> |                           |                   |
-  |                           | validate (ext, size)      |                   |
-  |                           | io.ReadAll(file)          |                   |
-  |                           |                           |                   |
-  |                           |  POST /inference          |                   |
-  |                           |  (multipart: audio)       |                   |
-  |                           |-------------------------> |                   |
-  |                           |                           | ggml-base.en      |
-  |                           |  {"text": "..."}          |                   |
-  |                           | <------------------------ |                   |
-  |                           |                           |                   |
-  |                           | validate transcript       |                   |
-  |                           | (min 20 words)            |                   |
-  |                           |                                               |
-  |                           |  POST /api/chat                               |
-  |                           |  (summarySystemPrompt + transcript)           |
-  |                           |---------------------------------------------> |
-  |                           |                           llama3.2:3b         |
-  |                           |  structured markdown                          |
-  |                           | <--------------------------------------------- |
-  |                           |                                               |
-  |                           | parseSections(raw)                            |
-  |                           | mdToHTML() x 4 sections                       |
-  |                           | ExecuteTemplate("result", data)               |
-  |  text/html fragment       |                                               |
-  | <------------------------ |                                               |
-  |  4 section cards          |                                               |
-  |  transcript accordion     |                                               |
+Browser                Go Server              whisper-cli         Ollama
+  |                        |                  (subprocess)        (port 11434)
+  | POST /summarize         |                       |                 |
+  | audio file              |                       |                 |
+  |-----------------------> |                       |                 |
+  |                         | validate ext + size   |                 |
+  |                         | os.CreateTemp(audio)  |                 |
+  |                         |                       |                 |
+  |                         | exec.Command(         |                 |
+  |                         |  whisper-cli -m model |                 |
+  |                         |  -f /tmp/audio.mp3)   |                 |
+  |                         |---------------------->|                 |
+  |                         |                  transcribes           |
+  |                         | reads .txt output     |                 |
+  |                         |<----------------------|                 |
+  |                         | defer os.Remove(temp files)            |
+  |                         |                                        |
+  |                         | ai.Chat(transcript + prompt)           |
+  |                         |--------------------------------------> |
+  |                         | structured markdown                    |
+  |                         |<-------------------------------------- |
+  |                         |                                        |
+  |                         | parseSections + mdToHTML               |
+  |                         | ExecuteTemplate("result")              |
+  | text/html fragment      |                                        |
+  |<----------------------- |                                        |
 ```
 
 ---
 
 ## Key Design Decisions
 
-### Why whisper.cpp as a separate server, not a Go library?
+**Why subprocess instead of HTTP server?**
+Homebrew's `whisper-cpp` package installs a CLI binary, not a server. Using `exec.Command` works with that binary directly, with no additional server process to start or manage.
 
-whisper.cpp has Go bindings but they require CGO — a C compiler must be present at build time. Every other project in this bootcamp builds with pure Go. The server mode keeps the stack CGO-free: whisper.cpp runs as its own process and Go calls it via HTTP, the same way Go calls Ollama.
+**Why `godotenv`?**
+Go's `os.Getenv()` only reads variables that are already exported in the shell session. It does not read `.env` files automatically. `godotenv.Load()` in `main.go` bridges this gap so students can set paths in `.env` without any shell-level exports.
 
-### Why extension-based validation for audio?
+**Why extension-based validation for audio?**
+`http.DetectContentType` is reliable for images but not for audio: M4A reports as `video/mp4`, OGG as `application/ogg`. Extension checking is simpler and gives users a clearer error message.
 
-`http.DetectContentType` is reliable for images (JPEG, PNG, WEBP all have clear magic bytes). Audio is messier: M4A reports as `video/mp4`, OGG as `application/ogg`, WebM as `video/webm`. None of these communicate "audio" unambiguously to a validator. Extension checking gives users a clear, accurate error message and is the right tool when byte sniffing is unreliable for the input type.
-
-### Why a 10-minute HTTP client timeout?
-
-`http.DefaultClient` has no timeout, which means a hanging whisper.cpp process would hang the Go handler indefinitely. A 10-minute cap is generous enough for a 30-minute meeting recording on typical hardware (transcription usually takes 10-20% of audio duration with the base model) while still preventing indefinite hangs.
-
-### Why `- [ ]` for action items?
-
-The GitHub task list format is standard markdown that goldmark converts to real `<input type="checkbox">` elements. JavaScript in the result template enables the checkboxes and applies a strikethrough class on check. This turns the action items from a static list into a usable checklist without any server-side state management.
+**Why `defer os.Remove` immediately after `os.CreateTemp`?**
+`defer` runs on every return path — success, validation failure, transcription error. Placing it immediately after the `CreateTemp` call guarantees the temp file is deleted regardless of how the function exits.
 
 ---
 
 ## Makefile Commands
 
 ```bash
-make run           # start the Go server (whisper + ollama must be running)
-make setup         # download Go deps and confirm Ollama model
-make setup-whisper # print whisper.cpp build and setup instructions
-make build         # compile to bin/app
+make run     # start the Go server
+make check   # verify whisper, model, and Ollama are all accessible
+make setup   # download Go deps, pull Ollama model, run check
+make tidy    # download Go dependencies only
+make build   # compile to bin/app
 make help
 ```
 
@@ -180,11 +330,11 @@ make help
 
 | # | Extension | What It Builds Toward |
 |---|---|---|
-| E1 | Show a live progress bar: "Transcribing... Summarising..." using SSE | Combining audio pipeline with streaming (Project 01 pattern) |
-| E2 | Save summaries to SQLite with timestamps (reuse Project 05's db/ pattern) | Persisting AI pipeline output |
-| E3 | Add a speaker detection mode: ask Whisper for VTT output and parse speaker turns | Structured transcript processing |
-| E4 | Support YouTube URLs: fetch audio via yt-dlp subprocess, feed to pipeline | Subprocess and external tool integration |
-| E5 | Let users ask follow-up questions about the transcript | Multi-turn conversation with persistent context |
+| E1 | Show live progress with SSE: "Transcribing... Summarising..." | Combining subprocess with streaming |
+| E2 | Save summaries to SQLite with timestamps (reuse Project 05 db/ pattern) | Persisting AI pipeline output |
+| E3 | Parse VTT output (`--output-vtt`) for timestamps | Structured transcript processing |
+| E4 | Accept a YouTube URL via yt-dlp subprocess | Chaining multiple subprocess calls |
+| E5 | Follow-up questions about the transcript | Multi-turn conversation with context |
 
 ---
 

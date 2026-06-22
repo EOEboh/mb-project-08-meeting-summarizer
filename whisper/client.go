@@ -1,119 +1,152 @@
-// Package whisper provides a client for the whisper.cpp local transcription server.
+// Package whisper provides a client for local audio transcription using whisper.cpp.
 //
-// whisper.cpp can run in server mode and expose an HTTP endpoint that accepts
-// audio files and returns plain text transcriptions. This package wraps that
-// HTTP call into a single function: Transcribe.
+// This package calls the whisper.cpp binary as a subprocess. It works with:
+//   - macOS Homebrew install: binary is "whisper-cpp"
+//   - Linux/Windows built from source: binary is "whisper-cli"
 //
-// Why a separate package instead of calling HTTP directly in the handler?
-// The same reason ai/ exists: keeping the transport and model concerns out of
-// handler code. If you swapped whisper.cpp for faster-whisper, Groq's Whisper
-// API, or any other transcription service, only this file changes.
+// Configuration (via .env or environment variables):
 //
-// Setup (run this before starting the Go server):
-//
-//	# Clone and build whisper.cpp
-//	git clone https://github.com/ggerganov/whisper.cpp
-//	cd whisper.cpp && make
-//
-//	# Download the base model (~150 MB — good balance of speed and accuracy)
-//	bash models/download-ggml-model.sh base.en
-//
-//	# Start the server on port 8888
-//	./server -m models/ggml-base.en.bin --port 8888
+//	WHISPER_BIN   — binary name or full path (auto-detected if not set)
+//	WHISPER_MODEL — full path to your .bin model file (auto-detected if not set)
 package whisper
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"mime/multipart"
-	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
-	"time"
 )
 
-// serverURL is the whisper.cpp server address.
-// Override with the WHISPER_URL environment variable.
-func serverURL() string {
-	if u := os.Getenv("WHISPER_URL"); u != "" {
-		return u
+// binaryName returns the whisper.cpp binary to run.
+// Checks WHISPER_BIN env var first, then auto-detects from PATH.
+func binaryName() string {
+	if b := os.Getenv("WHISPER_BIN"); b != "" {
+		return b
 	}
-	return "http://localhost:8888"
+	// Auto-detect: try common names in order.
+	// whisper-cpp  = Homebrew on macOS
+	// whisper-cli  = built from source (cmake)
+	for _, candidate := range []string{"whisper-cpp", "whisper-cli"} {
+		if path, err := exec.LookPath(candidate); err == nil && path != "" {
+			return candidate
+		}
+	}
+	return "whisper-cpp" // fallback — will produce a clear "not found" error
 }
 
-// transcriptionResponse maps the JSON returned by whisper.cpp /inference.
-// The server returns { "text": "transcribed content..." } when
-// response_format is set to "json".
-type transcriptionResponse struct {
-	Text string `json:"text"`
+// modelPath returns the path to the ggml model file.
+// Checks WHISPER_MODEL env var first, then searches common locations.
+func modelPath() string {
+	if m := os.Getenv("WHISPER_MODEL"); m != "" {
+		return m
+	}
+
+	// Auto-detect from common locations so students don't have to set
+	// WHISPER_MODEL manually if they followed the README download path.
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		// Standard download location from README
+		filepath.Join(home, "whisper-models", "ggml-base.en.bin"),
+		// Homebrew on Apple Silicon
+		"/opt/homebrew/share/whisper-cpp/models/ggml-base.en.bin",
+		// Homebrew on Intel Mac
+		"/usr/local/share/whisper-cpp/models/ggml-base.en.bin",
+		// Linux local
+		filepath.Join(home, ".local", "share", "whisper-models", "ggml-base.en.bin"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+
+	// Return the README default so the error message is helpful
+	return filepath.Join(home, "whisper-models", "ggml-base.en.bin")
 }
 
-// Transcribe sends audioBytes to the whisper.cpp server and returns the
-// plain-text transcript.
-//
-// filename is used as the multipart field filename — whisper.cpp uses the
-// extension to detect the audio format, so the name matters. Pass the
-// original uploaded filename rather than a generic placeholder.
-//
-// The HTTP client timeout is set to 10 minutes. A 30-minute meeting
-// recording with the base model typically transcribes in 2-4 minutes,
-// but giving generous headroom avoids spurious timeouts on slower machines.
+// Transcribe writes audioBytes to a temporary file, runs the whisper.cpp
+// binary against it, reads the generated .txt transcript, and returns
+// the plain-text result. Temp files are removed on return regardless of
+// success or failure.
 func Transcribe(audioBytes []byte, filename string) (string, error) {
-	url := serverURL() + "/inference"
+	bin := binaryName()
+	model := modelPath()
 
-	// Build the multipart form body.
-	// The whisper.cpp server expects the audio under the "file" field,
-	// and "response_format" set to "json" for machine-readable output.
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-
-	fw, err := w.CreateFormFile("file", filename)
-	if err != nil {
-		return "", fmt.Errorf("whisper: create form file: %w", err)
-	}
-	if _, err := fw.Write(audioBytes); err != nil {
-		return "", fmt.Errorf("whisper: write audio bytes: %w", err)
-	}
-
-	if err := w.WriteField("response_format", "json"); err != nil {
-		return "", fmt.Errorf("whisper: write response_format field: %w", err)
-	}
-	w.Close()
-
-	// Use a custom HTTP client with a long timeout.
-	// http.DefaultClient has no timeout, which is dangerous for production,
-	// but a 10-minute cap here prevents indefinite hangs on very large files.
-	client := &http.Client{Timeout: 10 * time.Minute}
-
-	req, err := http.NewRequest(http.MethodPost, url, &buf)
-	if err != nil {
-		return "", fmt.Errorf("whisper: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
-
-	resp, err := client.Do(req)
-	if err != nil {
+	// Verify binary is available before touching the filesystem.
+	if _, err := exec.LookPath(bin); err != nil {
 		return "", fmt.Errorf(
-			"whisper: server unreachable at %s — is whisper.cpp running? "+
-				"Run: ./server -m models/ggml-base.en.bin --port 8888 | %w",
-			serverURL(), err,
+			"whisper binary %q not found.\n"+
+				"  macOS:   brew install whisper-cpp\n"+
+				"  Linux:   build from source, add build/bin to PATH\n"+
+				"  Or set WHISPER_BIN in your .env file to the full path",
+			bin,
 		)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("whisper: server returned status %d", resp.StatusCode)
+	// Verify the model file exists.
+	if _, err := os.Stat(model); err != nil {
+		return "", fmt.Errorf(
+			"whisper model not found at: %s\n\n"+
+				"Download it with:\n"+
+				"  mkdir -p ~/whisper-models\n"+
+				"  curl -L -o ~/whisper-models/ggml-base.en.bin \\\n"+
+				"    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin\n\n"+
+				"Or set WHISPER_MODEL in your .env file to the actual path",
+			model,
+		)
 	}
 
-	var result transcriptionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("whisper: decode response: %w", err)
+	// Write uploaded audio to a temp file.
+	// whisper.cpp requires a file path — it cannot read from stdin.
+	ext := filepath.Ext(filename)
+	if ext == "" {
+		ext = ".wav"
+	}
+	tmpAudio, err := os.CreateTemp("", "whisper-audio-*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("whisper: create temp file: %w", err)
+	}
+	defer os.Remove(tmpAudio.Name())
+
+	if _, err := tmpAudio.Write(audioBytes); err != nil {
+		tmpAudio.Close()
+		return "", fmt.Errorf("whisper: write temp file: %w", err)
+	}
+	tmpAudio.Close()
+
+	// whisper.cpp writes the transcript to <inputfile>.txt when --output-txt is set.
+	transcriptPath := tmpAudio.Name() + ".txt"
+	defer os.Remove(transcriptPath)
+
+	// Run whisper.cpp.
+	cmd := exec.Command(bin,
+		"-m", model,
+		"-f", tmpAudio.Name(),
+		"--output-txt",
+		"--language", "en",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// whisper.cpp sometimes exits non-zero even on success (minor warnings).
+		// Only treat it as a real error if the transcript file was not produced.
+		if _, statErr := os.Stat(transcriptPath); statErr != nil {
+			return "", fmt.Errorf("whisper: transcription failed: %w\n%s", err, output)
+		}
 	}
 
-	transcript := strings.TrimSpace(result.Text)
+	content, err := os.ReadFile(transcriptPath)
+	if err != nil {
+		return "", fmt.Errorf("whisper: read transcript: %w", err)
+	}
+
+	transcript := strings.TrimSpace(string(content))
 	if transcript == "" {
-		return "", fmt.Errorf("whisper: empty transcript — the audio may be silent or the model could not detect speech")
+		return "", fmt.Errorf(
+			"whisper: empty transcript — " +
+				"the audio may be silent, too noisy, or too short. " +
+				"Try a clearer recording or a larger model",
+		)
 	}
 
 	return transcript, nil
