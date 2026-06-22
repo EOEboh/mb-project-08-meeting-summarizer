@@ -1,17 +1,290 @@
+{{/*
+  index.html contains two named Go templates:
+    "index"  — full upload page, served on GET /
+    "result" — HTML fragment returned to HTMX on POST /summarize
+
+  Action items use - [ ] GitHub task syntax which goldmark renders as
+  <input type="checkbox"> elements. JavaScript makes them interactive
+  (checking persists in the session via CSS class toggling).
+*/}}
+
+{{define "index"}}
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bootcamp Scaffold</title>
-    <link rel="stylesheet" href="/static/style.css">
-    <!-- HTMX: progressive enhancement for server interactions -->
-    <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meeting Notes Summarizer — Project 08</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+
+  <style>
+    body { display:flex; flex-direction:column; min-height:100vh; }
+
+    /* ── Header ──────────────────────────────────────────────────────── */
+    header { display:flex; align-items:center; gap:12px; padding:14px 24px; border-bottom:1px solid var(--border); flex-shrink:0; }
+    .logo  { width:30px; height:30px; background:var(--accent); border-radius:6px; display:grid; place-items:center; font-size:14px; color:#000; font-weight:700; }
+    header h1 { font-size:0.95rem; font-weight:600; }
+    .badge-row { margin-left:auto; display:flex; gap:8px; }
+    .model-badge { font-family:var(--font-mono); font-size:0.68rem; padding:3px 10px; border-radius:99px; border:1px solid; }
+    .badge-whisper { color:#f59e0b; background:#f59e0b22; border-color:#f59e0b; }
+    .badge-ollama  { color:var(--accent); background:var(--accent-dim); border-color:var(--accent); }
+
+    main { flex:1; max-width:800px; width:100%; margin:0 auto; padding:32px 24px 48px; }
+
+    /* ── Upload card ─────────────────────────────────────────────────── */
+    .upload-card { background:var(--surface); border:2px dashed var(--border); border-radius:12px; padding:36px 32px; text-align:center; transition:border-color 0.2s; }
+
+    .upload-icon { font-size:2.4rem; margin-bottom:10px; opacity:0.6; }
+    .upload-card h2 { font-size:1.05rem; font-weight:600; margin-bottom:6px; }
+    .upload-card > p { font-size:0.86rem; color:var(--text-muted); margin-bottom:22px; }
+
+    input[type="file"] { display:none; }
+
+    .file-label { display:inline-flex; align-items:center; gap:10px; background:transparent; border:1px solid var(--border); border-radius:var(--radius); padding:10px 20px; font-size:0.88rem; cursor:pointer; transition:border-color 0.15s, color 0.15s; margin-bottom:10px; }
+    .file-label:hover { border-color:var(--accent); color:var(--accent); }
+
+    .file-info { font-size:0.78rem; color:var(--text-muted); font-family:var(--font-mono); margin-bottom:18px; min-height:18px; }
+    .constraints { font-size:0.74rem; color:var(--text-muted); margin-bottom:22px; }
+
+    button[type="submit"] { background:var(--accent); border:none; border-radius:var(--radius); color:#000; font-family:var(--font-sans); font-size:0.9rem; font-weight:600; padding:10px 28px; cursor:pointer; transition:opacity 0.15s, transform 0.1s; }
+    button[type="submit"]:hover { opacity:0.85; }
+    button[type="submit"]:active { transform:scale(0.97); }
+
+    /* ── Pipeline notice ─────────────────────────────────────────────── */
+    .pipeline-notice { display:flex; gap:16px; justify-content:center; align-items:center; font-size:0.78rem; color:var(--text-muted); margin-bottom:20px; flex-wrap:wrap; }
+    .pipeline-step { display:flex; align-items:center; gap:6px; }
+    .pipeline-dot  { width:8px; height:8px; border-radius:50%; }
+    .dot-whisper   { background:#f59e0b; }
+    .dot-ollama    { background:var(--accent); }
+    .pipeline-arrow { opacity:0.4; }
+
+    /* ── HTMX indicator ──────────────────────────────────────────────── */
+    .htmx-indicator { opacity:0; transition:opacity 200ms ease; display:flex; align-items:center; justify-content:center; gap:8px; font-size:0.82rem; color:var(--text-muted); margin-top:14px; }
+    .htmx-indicator.htmx-request, .htmx-request .htmx-indicator { opacity:1; }
+    .spinner-ring { width:14px; height:14px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.7s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+
+    /* ── Result area ─────────────────────────────────────────────────── */
+    #result { margin-top:28px; }
+    .empty-state { display:flex; flex-direction:column; align-items:center; padding:40px; gap:10px; color:var(--text-muted); text-align:center; }
+    .empty-state .icon { font-size:2rem; opacity:0.4; }
+    .empty-state p { font-size:0.86rem; max-width:280px; line-height:1.5; }
+
+    /* ── Result summary bar ──────────────────────────────────────────── */
+    .result-bar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:18px; animation:fadeUp 0.25s ease; }
+    @keyframes fadeUp { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    .result-meta { font-size:0.78rem; color:var(--text-muted); font-family:var(--font-mono); }
+    .export-btn { background:transparent; border:1px solid var(--accent); border-radius:6px; color:var(--accent); font-size:0.8rem; padding:5px 16px; cursor:pointer; transition:background 0.15s, color 0.15s; }
+    .export-btn:hover { background:var(--accent); color:#000; }
+
+    /* ── Section cards ───────────────────────────────────────────────── */
+    .section-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; margin-bottom:12px; overflow:hidden; animation:fadeUp 0.25s ease; }
+    .section-header { display:flex; align-items:center; gap:10px; padding:11px 16px; border-bottom:1px solid var(--border); }
+    .section-icon  { font-size:1rem; }
+    .section-label { font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); }
+    .section-body  { padding:14px 18px; }
+
+    /* Prose for goldmark output inside section cards */
+    .section-body p  { font-size:0.92rem; color:var(--text); line-height:1.75; margin-bottom:8px; }
+    .section-body p:last-child { margin-bottom:0; }
+    .section-body ul, .section-body ol { padding-left:20px; margin-bottom:6px; }
+    .section-body li { font-size:0.92rem; color:var(--text); line-height:1.7; margin-bottom:5px; }
+
+    /* Action item checkboxes — goldmark renders - [ ] as input[type=checkbox] */
+    .section-body input[type="checkbox"] { accent-color:var(--accent); width:15px; height:15px; cursor:pointer; vertical-align:middle; margin-right:6px; }
+    .section-body li.completed { text-decoration:line-through; color:var(--text-muted); }
+
+    /* ── Transcript accordion ────────────────────────────────────────── */
+    .transcript-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; margin-bottom:12px; overflow:hidden; animation:fadeUp 0.25s ease; }
+    .transcript-toggle { display:flex; align-items:center; justify-content:space-between; padding:11px 16px; cursor:pointer; user-select:none; }
+    .transcript-toggle-label { font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); display:flex; align-items:center; gap:8px; }
+    .transcript-chevron { font-size:0.7rem; color:var(--text-muted); transition:transform 0.2s; }
+    .transcript-chevron.open { transform:rotate(180deg); }
+    .transcript-body { display:none; padding:14px 18px; border-top:1px solid var(--border); }
+    .transcript-body.open { display:block; }
+    .transcript-body p { font-size:0.85rem; color:var(--text-muted); line-height:1.75; white-space:pre-wrap; font-family:var(--font-mono); }
+
+    /* Error box */
+    .error-box { background:#2a1a1a; border:1px solid #5a2a2a; border-radius:var(--radius); padding:14px 18px; color:#f87171; font-size:0.88rem; }
+  </style>
 </head>
 <body>
-    <main>
-        <h1>Bootcamp Scaffold</h1>
-        <p>Replace this template with your own project UI</p>
-    </main>
+
+  <header>
+    <div class="logo">◈</div>
+    <h1>Meeting Notes Summarizer</h1>
+    <div class="badge-row">
+      <span class="model-badge badge-whisper">whisper.cpp</span>
+      <span class="model-badge badge-ollama">llama3.2:3b</span>
+    </div>
+  </header>
+
+  <main>
+    <form
+      hx-post="/summarize"
+      hx-target="#result"
+      hx-swap="innerHTML"
+      hx-indicator="#spinner"
+      hx-encoding="multipart/form-data"
+    >
+      <div class="upload-card">
+        <div class="upload-icon">🎙️</div>
+        <h2>Upload a Meeting Recording</h2>
+        <p>Get an AI-generated summary with decisions, action items, and next steps.</p>
+
+        <div class="pipeline-notice">
+          <div class="pipeline-step"><div class="pipeline-dot dot-whisper"></div>whisper.cpp transcribes audio</div>
+          <div class="pipeline-arrow">→</div>
+          <div class="pipeline-step"><div class="pipeline-dot dot-ollama"></div>llama3.2:3b summarises transcript</div>
+        </div>
+
+        <input type="file" name="audio" id="audio-input" accept=".wav,.mp3,.m4a,.ogg,.webm,.mp4,.flac">
+
+        <label for="audio-input" class="file-label">
+          <span>📎</span>
+          <span id="file-label-text">Choose an audio file</span>
+        </label>
+
+        <div class="file-info" id="file-info"></div>
+        <div class="constraints">WAV · MP3 · M4A · OGG · FLAC · WebM · Maximum 50 MB</div>
+
+        <button type="submit">Summarize Meeting</button>
+
+        <div id="spinner" class="htmx-indicator">
+          <div class="spinner-ring"></div>
+          <span>Transcribing and summarising... this may take 1–5 minutes</span>
+        </div>
+      </div>
+    </form>
+
+    <div id="result">
+      <div class="empty-state">
+        <span class="icon">◈</span>
+        <p>Upload a meeting recording above to generate structured notes.</p>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const audioInput   = document.getElementById('audio-input');
+    const fileLabelTxt = document.getElementById('file-label-text');
+    const fileInfo     = document.getElementById('file-info');
+
+    audioInput.addEventListener('change', function () {
+      const file = this.files[0];
+      if (!file) { fileLabelTxt.textContent = 'Choose an audio file'; fileInfo.textContent = ''; return; }
+      fileLabelTxt.textContent = file.name;
+      fileInfo.textContent = (file.size / (1024*1024)).toFixed(1) + ' MB · ' + file.type;
+    });
+  </script>
+
 </body>
 </html>
+{{end}}
+
+
+{{define "result"}}
+{{if .Error}}
+  <div class="error-box">⚠ {{.Error}}</div>
+{{else}}
+
+  {{/* Summary bar */}}
+  <div class="result-bar">
+    <div>
+      <div style="font-size:0.9rem;font-weight:600;">{{.FileName}}</div>
+      <div class="result-meta">{{.WordCount}} words transcribed · completed in {{printf "%.0f" .ElapsedSec}}s</div>
+    </div>
+    <form action="/export" method="POST" style="display:inline">
+      <input type="hidden" name="markdown" value="{{.FullMarkdown}}">
+      <input type="hidden" name="filename" value="meeting-notes.md">
+      <button type="submit" class="export-btn">Download .md</button>
+    </form>
+  </div>
+
+  {{/* Meeting Summary */}}
+  {{if .Overview}}
+  <div class="section-card">
+    <div class="section-header">
+      <span class="section-icon">📋</span>
+      <span class="section-label">Meeting Summary</span>
+    </div>
+    <div class="section-body">{{.Overview}}</div>
+  </div>
+  {{end}}
+
+  {{/* Decisions Made */}}
+  {{if .Decisions}}
+  <div class="section-card">
+    <div class="section-header">
+      <span class="section-icon">✅</span>
+      <span class="section-label">Decisions Made</span>
+    </div>
+    <div class="section-body">{{.Decisions}}</div>
+  </div>
+  {{end}}
+
+  {{/* Action Items */}}
+  {{if .ActionItems}}
+  <div class="section-card">
+    <div class="section-header">
+      <span class="section-icon">📌</span>
+      <span class="section-label">Action Items</span>
+    </div>
+    <div class="section-body" id="action-items">{{.ActionItems}}</div>
+  </div>
+  {{end}}
+
+  {{/* Next Steps */}}
+  {{if .NextSteps}}
+  <div class="section-card">
+    <div class="section-header">
+      <span class="section-icon">🗓</span>
+      <span class="section-label">Next Steps</span>
+    </div>
+    <div class="section-body">{{.NextSteps}}</div>
+  </div>
+  {{end}}
+
+  {{/* Transcript — collapsible */}}
+  <div class="transcript-card">
+    <div class="transcript-toggle" onclick="toggleTranscript(this)">
+      <span class="transcript-toggle-label">
+        <span>📝</span>
+        Full Transcript ({{.WordCount}} words)
+      </span>
+      <span class="transcript-chevron" id="chevron">▼</span>
+    </div>
+    <div class="transcript-body" id="transcript-body">
+      <p>{{.Transcript}}</p>
+    </div>
+  </div>
+
+  <script>
+    function toggleTranscript(toggle) {
+      const body    = document.getElementById('transcript-body');
+      const chevron = document.getElementById('chevron');
+      body.classList.toggle('open');
+      chevron.classList.toggle('open');
+    }
+
+    // Make action item checkboxes interactive within the page session.
+    // goldmark renders - [ ] as disabled checkboxes by default in some versions.
+    // This script enables them and applies a strikethrough class on check.
+    const actionSection = document.getElementById('action-items');
+    if (actionSection) {
+      actionSection.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.removeAttribute('disabled');
+        cb.addEventListener('change', function () {
+          const li = this.closest('li');
+          if (li) li.classList.toggle('completed', this.checked);
+        });
+      });
+    }
+  </script>
+
+{{end}}
+{{end}}
