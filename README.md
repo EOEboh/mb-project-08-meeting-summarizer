@@ -1,6 +1,6 @@
 # Project 08: Meeting Notes Summarizer
 
-> **Bootcamp Day 19** · Tier 3: Complex · Est. build time: 75 min
+> **Bootcamp Day 8** · Tier 3: Complex · Est. build time: 75 min
 
 Upload a meeting recording and get structured notes: a summary, decisions made, action items with interactive checkboxes, and next steps. Download everything as a markdown file.
 
